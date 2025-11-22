@@ -207,6 +207,7 @@ export class PeerProxyStepImpl extends PeerProxyStep {
 
     async handle(connection: MockRTCConnection) {
         const externalConn = new RTCConnection();
+        if (!this.externalConnections) this.externalConnections = [];
         this.externalConnections.push(externalConn);
 
         // We mirror the internal peer's SDP as an offer to the given connection:
@@ -243,7 +244,7 @@ export class PeerProxyStepImpl extends PeerProxyStep {
     }
 
     dispose(): void {
-        this.externalConnections.forEach(conn => conn.close());
+        if (this.externalConnections) this.externalConnections.forEach(conn => conn.close());
     }
 
 }
@@ -252,6 +253,7 @@ export class DynamicProxyStepImpl extends DynamicProxyStep {
 
     async handle(connection: MockRTCConnection) {
         const externalConn = await connection.proxyTrafficToExternalConnection();
+        if (!this.externalConnections) this.externalConnections = [];
         this.externalConnections.push(externalConn);
 
         // This step keeps running indefinitely, until the connection closes
@@ -259,7 +261,7 @@ export class DynamicProxyStepImpl extends DynamicProxyStep {
     }
 
     dispose(): void {
-        this.externalConnections.forEach(conn => conn.close());
+        if (this.externalConnections) this.externalConnections.forEach(conn => conn.close());
     }
 
 }
