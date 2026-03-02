@@ -16,6 +16,11 @@ import type * as NodeDataChannel from 'node-datachannel';
  */
 export class DataChannelStream extends stream.Duplex {
 
+    private readonly channelId: number;
+    private readonly channelLabel: string;
+    private readonly channelProtocol: string;
+    private pendingMessages: Array<string | Buffer> = [];
+
     constructor(
         private rawChannel: NodeDataChannel.DataChannel,
         streamOptions: {
@@ -31,17 +36,21 @@ export class DataChannelStream extends stream.Duplex {
             objectMode: true // Preserve the string/buffer distinction (WebRTC treats them differently)
         });
 
+        this.channelId = rawChannel.getId();
+        this.channelLabel = rawChannel.getLabel();
+        this.channelProtocol = rawChannel.getProtocol();
+
         rawChannel.onMessage((msg) => {
             // Independently of the stream and it's normal events, we also fire our own
             // read/wrote-data events, used for MockRTC event subscriptions. These aren't
             // buffered, and this ensures that those events do not consume data that will
             // separately be processed by handler steps.
+            const size = Buffer.isBuffer(msg) ? msg.byteLength : msg.length;
+            console.log(`[MockRTC] DataChannelStream onMessage — channel="${this.channelLabel}" ${Buffer.isBuffer(msg) ? 'binary' : 'text'} ${size} bytes`);
             this.emit('read-data', msg);
 
-            if (!this._readActive) return; // If the buffer is full, drop messages.
-
-            // If the push is rejected, we pause reading until the next call to _read().
-            this._readActive = this.push(msg);
+            this.pendingMessages.push(msg);
+            this.flushPendingMessages();
         });
 
         // When the DataChannel closes, the readable & writable ends close
@@ -79,30 +88,33 @@ export class DataChannelStream extends stream.Duplex {
     _read() {
         // Stop dropping messages, if the buffer filling up meant we were doing so before.
         this._readActive = true;
+        this.flushPendingMessages();
+    }
+
+    private flushPendingMessages() {
+        while (this._readActive && this.pendingMessages.length > 0) {
+            const nextMessage = this.pendingMessages.shift()!;
+
+            // If the push is rejected, we pause flushing until the next call to _read().
+            this._readActive = this.push(nextMessage);
+        }
     }
 
     _write(chunk: string | Buffer | unknown, encoding: string, callback: (error: Error | null) => void) {
-        let sentOk: boolean;
-
         try {
             if (Buffer.isBuffer(chunk)) {
-                sentOk = this.rawChannel.sendMessageBinary(chunk);
+                this.rawChannel.sendMessageBinary(chunk as unknown as Uint8Array);
             } else if (typeof chunk === 'string') {
-                sentOk = this.rawChannel.sendMessage(chunk);
+                this.rawChannel.sendMessage(chunk);
             } else {
                 const typeName = (chunk as object).constructor.name || typeof chunk;
                 throw new Error(`Cannot write ${typeName} to DataChannel stream`);
             }
 
             this.emit('wrote-data', chunk);
-        } catch (err: any) {
-            return callback(err);
-        }
-
-        if (sentOk) {
             callback(null);
-        } else {
-            callback(new Error("Failed to write to DataChannel"));
+        } catch (e) {
+            callback(e as Error);
         }
     }
 
@@ -118,15 +130,15 @@ export class DataChannelStream extends stream.Duplex {
     }
 
     get id() {
-        return this.rawChannel.getId();
+        return this.channelId;
     }
 
     get label() {
-        return this.rawChannel.getLabel();
+        return this.channelLabel;
     }
 
     get protocol() {
-        return this.rawChannel.getProtocol();
+        return this.channelProtocol;
     }
 
 }

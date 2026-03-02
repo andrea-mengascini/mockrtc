@@ -58,6 +58,7 @@ export class MockRTCServerPeer implements MockRTCPeer {
             // Here we listen to the various internal connection events, and convert them into
             // their corresponding public-API events.
             conn.once('connection-connected', () => {
+                console.log(`[MockRTC] WebRTC connected — sessionId=${conn.id}`);
                 const timingEvents: TimingEvents = {
                     startTime: Date.now(),
                     connectTimestamp: now()
@@ -107,6 +108,7 @@ export class MockRTCServerPeer implements MockRTCPeer {
                     };
 
                     const announceOpen = () => {
+                        console.log(`[MockRTC] DataChannel opened — label="${channelStream.label}" id=${channelStream.id} sessionId=${conn.id}`);
                         this.eventEmitter.emit('data-channel-opened', {
                             ...channelEventParams,
                             channelLabel: channelStream.label,
@@ -119,6 +121,8 @@ export class MockRTCServerPeer implements MockRTCPeer {
 
                     const emitMessage = (direction: 'sent' | 'received') => (data: Buffer | string) => {
                         const isBinary = Buffer.isBuffer(data);
+                        const size = isBinary ? (data as Buffer).byteLength : (data as string).length;
+                        console.log(`[MockRTC] DataChannel message ${direction} — label="${channelStream.label}" ${isBinary ? 'binary' : 'text'} ${size} bytes`);
 
                         const content: Buffer = isBinary
                             ? data
@@ -292,6 +296,7 @@ export class MockRTCServerPeer implements MockRTCPeer {
     }
 
     async answerOffer(offer: RTCSessionDescriptionInit, options: AnswerOptions = {}): Promise<MockRTCAnswerParams> {
+        console.log(`[MockRTC] answerOffer called — creating internal mock connection`);
         if (this.debug) console.log(`Answering offer for mocking for ${this.peerId}`);
 
         const conn = this.createConnection();
