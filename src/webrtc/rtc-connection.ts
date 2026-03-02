@@ -237,7 +237,7 @@ export class RTCConnection extends EventEmitter {
         if (!this.rawConn) throw new Error("Can't get selected candidates after connection is closed");
 
         const candidates = this.rawConn.getSelectedCandidatePair();
-        if (!candidates) return undefined;
+        if (!candidates || !candidates.local || !candidates.remote) return undefined;
 
         // Rename transportType -> protocol, to better match the browser WebRTC APIs
         return {

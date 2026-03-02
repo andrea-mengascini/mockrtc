@@ -70,7 +70,7 @@ export class MockRTCServerPeer implements MockRTCPeer {
                     timingEvents
                 };
 
-                const selectedCandidates = conn.getSelectedCandidates()!;
+                const selectedCandidates = conn.getSelectedCandidates();
 
                 this.eventEmitter.emit('peer-connected', {
                     ...connectionEventParams,
@@ -79,14 +79,14 @@ export class MockRTCServerPeer implements MockRTCPeer {
                     remoteSessionDescription: conn.getRemoteDescription(),
                     metadata: conn.metadata,
 
-                    selectedLocalCandidate: selectedCandidates.local,
-                    selectedRemoteCandidate: selectedCandidates.remote
+                    selectedLocalCandidate: selectedCandidates?.local,
+                    selectedRemoteCandidate: selectedCandidates?.remote
                 });
 
                 conn.once('external-connection-attached', (externalConn: RTCConnection) => {
                     timingEvents.externalAttachTimestamp = now();
 
-                    const selectedExternalCandidates = externalConn.getSelectedCandidates()!;
+                    const selectedExternalCandidates = externalConn.getSelectedCandidates();
 
                     this.eventEmitter.emit('external-peer-attached', {
                         ...connectionEventParams,
@@ -95,8 +95,8 @@ export class MockRTCServerPeer implements MockRTCPeer {
                             localSessionDescription: externalConn.getLocalDescription(),
                             remoteSessionDescription: externalConn.getRemoteDescription(),
 
-                            selectedLocalCandidate: selectedExternalCandidates.local,
-                            selectedRemoteCandidate: selectedExternalCandidates.remote
+                            selectedLocalCandidate: selectedExternalCandidates?.local,
+                            selectedRemoteCandidate: selectedExternalCandidates?.remote
                         }
                     });
                 });
