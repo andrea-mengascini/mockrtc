@@ -8,6 +8,41 @@ import * as PluggableAdmin from 'mockttp/dist/pluggable-admin-api/pluggable-admi
 import { MockRTCSessionDescription } from '../mockrtc';
 import type { RTCConnection } from '../webrtc/rtc-connection';
 
+type MaybePromise<T> = T | Promise<T>;
+
+/**
+ * A single data channel message, as seen by beforeDataChannelMessage callbacks.
+ */
+export interface RTCDataChannelMessage {
+    /** Raw bytes. Call .toString('utf8') for text messages. */
+    content: Buffer;
+    isBinary: boolean;
+    channelLabel: string;
+    /** 'internal' = browser peer → server; 'external' = server → browser peer */
+    fromPeer: 'internal' | 'external';
+}
+
+/**
+ * Passed to beforeDataChannelMessage — lets the callback inject messages in either
+ * direction at any time (out-of-order, replay, etc.).
+ */
+export interface RTCDataChannelChannel {
+    /** Send a message toward the browser (internal peer). */
+    toPeer:   (content: string | Buffer, isBinary?: boolean) => void;
+    /** Send a message toward the real remote server (external peer). */
+    toRemote: (content: string | Buffer, isBinary?: boolean) => void;
+    label: string;
+}
+
+export type RTCDataChannelMessageResult =
+    | { action: 'forward'; content?: string | Buffer }
+    | { action: 'drop' };
+
+export type BeforeDataChannelMessage = (
+    message: RTCDataChannelMessage,
+    channel: RTCDataChannelChannel
+) => MaybePromise<RTCDataChannelMessageResult | void>;
+
 export type Serializable = PluggableAdmin.Serialization.Serializable;
 export const { Serializable } = PluggableAdmin.Serialization;
 type ClientServerChannel = PluggableAdmin.Serialization.ClientServerChannel;
@@ -197,8 +232,21 @@ export class DynamicProxyStep extends Serializable implements HandlerStepDefinit
 
     protected externalConnections: RTCConnection[] = []; // Set here so it can be used in impl subclass
 
+    /** Callback applied to every data channel message in both directions. Not serialized. */
+    public beforeDataChannelMessage?: BeforeDataChannelMessage;
+
+    constructor(options: { beforeDataChannelMessage?: BeforeDataChannelMessage } = {}) {
+        super();
+        this.beforeDataChannelMessage = options.beforeDataChannelMessage;
+    }
+
     explain() {
         return `proxy the RTC connection to a remote peer`;
+    }
+
+    serialize(_channel: ClientServerChannel): {} {
+        // beforeDataChannelMessage is a function — not serializable, intentionally omitted
+        return { type: this.type };
     }
 
 }

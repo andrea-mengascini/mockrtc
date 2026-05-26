@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as path from "path";
 import { EventEmitter } from "events";
 
 import { MockRTC, MockRTCEvent, MockRTCOptions } from "../mockrtc";
@@ -13,8 +14,19 @@ import { RTCConnection } from "../webrtc/rtc-connection";
 
 import type { MatcherDefinition } from "../matching/matcher-definitions";
 import { MatcherImpl, MatcherLookup } from "../matching/matcher-impls";
-import type { HandlerStepDefinition } from "../handling/handler-step-definitions";
+import type { BeforeDataChannelMessage, HandlerStepDefinition } from "../handling/handler-step-definitions";
 import { DynamicProxyStepImpl, HandlerStepImpl, StepLookup } from "../handling/handler-step-impls";
+
+function composeDataChannelRules(rules: any[]): BeforeDataChannelMessage {
+    return async (msg, channel) => {
+        for (const rule of rules) {
+            if (rule.match(msg)) {
+                const result = await rule.transform(msg, channel);
+                if (result != null) return result;
+            }
+        }
+    };
+}
 
 const MATCHING_PEER_ID = 'matching-peer';
 
@@ -27,6 +39,17 @@ export class MockRTCServer extends MockRTCBase implements MockRTC {
     ) {
         super();
         this.debug = !!options.debug;
+
+        if (!options.beforeDataChannelMessage && process.env.WEBRTC_RULES) {
+            try {
+                const ruleOrRules = require(path.resolve(process.env.WEBRTC_RULES));
+                const rules = Array.isArray(ruleOrRules) ? ruleOrRules : [ruleOrRules];
+                this.options = { ...options, beforeDataChannelMessage: composeDataChannelRules(rules) };
+                console.log(`[MockRTC] Loaded ${rules.length} data channel rule(s) from ${process.env.WEBRTC_RULES}`);
+            } catch (e) {
+                console.error('[MockRTC] Failed to load WEBRTC_RULES:', e);
+            }
+        }
     }
 
     private eventEmitter = new EventEmitter();
@@ -114,10 +137,12 @@ export class MockRTCServer extends MockRTCBase implements MockRTC {
         });
 
         const handlerSteps = handlerStepDefinitions.map((definition): HandlerStepImpl => {
-            return Object.assign(
+            const step = Object.assign(
                 Object.create(StepLookup[definition.type].prototype),
                 definition
             );
+            this.injectHook(step);
+            return step;
         });
 
         this.rules.push({ matchers, handlerSteps });
@@ -143,17 +168,29 @@ export class MockRTCServer extends MockRTCBase implements MockRTC {
 
         // Unmatched connections are proxied dynamically. In practice, that means they're accepted
         // and ignored initially, unless an external peer also connects and is attached:
-        return [new DynamicProxyStepImpl()];
+        console.log(`[MockRTC] matchConnection → DynamicProxy hook=${!!this.options.beforeDataChannelMessage}`);
+        return [new DynamicProxyStepImpl({ beforeDataChannelMessage: this.options.beforeDataChannelMessage })];
     }
 
     // Peer definition API:
 
+    private injectHook(step: HandlerStepImpl): void {
+        if (step.type === 'rtc-dynamic-proxy' && this.options.beforeDataChannelMessage) {
+            const dynStep = step as DynamicProxyStepImpl;
+            if (!dynStep.beforeDataChannelMessage) {
+                dynStep.beforeDataChannelMessage = this.options.beforeDataChannelMessage;
+            }
+        }
+    }
+
     async buildPeerFromDefinition(handlerStepDefinitions: HandlerStepDefinition[]): Promise<MockRTCServerPeer> {
         const handlerSteps = handlerStepDefinitions.map((definition): HandlerStepImpl => {
-            return Object.assign(
+            const step = Object.assign(
                 Object.create(StepLookup[definition.type].prototype),
                 definition
             );
+            this.injectHook(step);
+            return step;
         });
         const peer = new MockRTCServerPeer(
             () => handlerSteps, // Always runs a fixed set of steps

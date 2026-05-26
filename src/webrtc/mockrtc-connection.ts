@@ -3,13 +3,82 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { Transform } from 'stream';
 import type * as NodeDataChannel from 'node-datachannel';
 
 import { MockRTCControlMessage, MOCKRTC_CONTROL_CHANNEL } from './control-channel';
+import type {
+    BeforeDataChannelMessage,
+    RTCDataChannelChannel,
+    RTCDataChannelMessage,
+    RTCDataChannelMessageResult
+} from '../handling/handler-step-definitions';
 
 import { DataChannelStream } from './datachannel-stream';
 import { MediaTrackStream } from './mediatrack-stream';
 import { RTCConnection } from './rtc-connection';
+
+// ── Data channel transform helpers ──────────────────────────────────────────
+
+function normalizeForWrite(content: string | Buffer, isBinary: boolean): string | Buffer {
+    return isBinary
+        ? (Buffer.isBuffer(content) ? content : Buffer.from(content as string))
+        : (typeof content === 'string' ? content : content.toString('utf8'));
+}
+
+function makeTransformPipe(
+    src: DataChannelStream,
+    dst: DataChannelStream,
+    fromPeer: RTCDataChannelMessage['fromPeer'],
+    injection: RTCDataChannelChannel,
+    hook: BeforeDataChannelMessage
+): void {
+    const t = new Transform({
+        objectMode: true,
+        transform(chunk: string | Buffer, _enc: string, done: (err?: Error | null, data?: any) => void) {
+            const isBinary = Buffer.isBuffer(chunk);
+            const content = isBinary ? chunk as Buffer : Buffer.from(chunk as string);
+            console.log(`[MockRTC] Transform chunk fromPeer=${fromPeer} label="${src.label}" isBinary=${isBinary} size=${content.length}`);
+
+            Promise.resolve(hook({ content, isBinary, channelLabel: src.label, fromPeer }, injection))
+                .then((result: RTCDataChannelMessageResult | void) => {
+                    if (result?.action === 'drop') { done(); return; }
+                    if (result?.action === 'forward' && result.content != null) {
+                        done(null, normalizeForWrite(result.content, isBinary));
+                    } else {
+                        done(null, chunk); // forward unchanged
+                    }
+                })
+                .catch((e: Error) => {
+                    console.error('[MockRTC] beforeDataChannelMessage error:', e);
+                    done(null, chunk);
+                });
+        }
+    });
+    src.pipe(t).pipe(dst);
+}
+
+function proxyChannelPair(
+    internalCh: DataChannelStream,
+    externalCh: DataChannelStream,
+    hook?: BeforeDataChannelMessage
+): void {
+    console.log(`[MockRTC] proxyChannelPair label="${internalCh.label}" hook=${!!hook}`);
+    if (!hook) {
+        internalCh.pipe(externalCh);
+        externalCh.pipe(internalCh);
+        return;
+    }
+
+    const injection: RTCDataChannelChannel = {
+        toPeer:   (c, b = false) => internalCh.write(normalizeForWrite(c, b)),
+        toRemote: (c, b = false) => externalCh.write(normalizeForWrite(c, b)),
+        label: internalCh.label
+    };
+
+    makeTransformPipe(internalCh, externalCh, 'internal', injection, hook);
+    makeTransformPipe(externalCh, internalCh, 'external', injection, hook);
+}
 
 export class MockRTCConnection extends RTCConnection {
 
@@ -84,16 +153,16 @@ export class MockRTCConnection extends RTCConnection {
         }
     }
 
-    async proxyTrafficToExternalConnection() {
+    async proxyTrafficToExternalConnection(hook?: BeforeDataChannelMessage) {
         if (!this.externalConnection) {
             await new Promise((resolve) => this.once('external-connection-attached', resolve));
         }
 
-        await this.proxyTrafficTo(this.externalConnection!);
+        await this.proxyTrafficTo(this.externalConnection!, hook);
         return this.externalConnection!;
     }
 
-    async proxyTrafficTo(externalConnection: RTCConnection) {
+    async proxyTrafficTo(externalConnection: RTCConnection, hook?: BeforeDataChannelMessage) {
         if (this.externalConnection) {
             if (externalConnection !== this.externalConnection) {
                 throw new Error('Cannot attach multiple external connections');
@@ -132,22 +201,24 @@ export class MockRTCConnection extends RTCConnection {
         // Forward *all* existing internal channels to the external connection:
         this.channels.forEach((channel: DataChannelStream) => { // All channels, in case a previous step created one
             const mirrorChannelStream = externalConnection.createDataChannel(channel.label);
-            channel.pipe(mirrorChannelStream).pipe(channel);
+            proxyChannelPair(channel, mirrorChannelStream, hook);
         });
 
         // Forward any existing external channels back to this peer connection. Note that we're mirroring
         // *remote* channels only, so we skip the channels that we've just created above.
         externalConnection.remoteChannels.forEach((channel: DataChannelStream) => {
             const mirrorChannelStream = this.createDataChannel(channel.label);
-            channel.pipe(mirrorChannelStream).pipe(channel);
+            proxyChannelPair(mirrorChannelStream, channel, hook); // mirror=internal, channel=external
         });
 
         // If any new channels open in future, mirror them to the other peer:
-        [[this, externalConnection], [externalConnection, this]].forEach(([connA, connB]) => {
-            connA.on('remote-channel-created', (incomingChannel: DataChannelStream) => {
-                const mirrorChannelStream = connB.createDataChannel(incomingChannel.label);
-                incomingChannel.pipe(mirrorChannelStream).pipe(incomingChannel);
-            });
+        this.on('remote-channel-created', (incomingChannel: DataChannelStream) => {
+            const mirrorChannelStream = externalConnection.createDataChannel(incomingChannel.label);
+            proxyChannelPair(incomingChannel, mirrorChannelStream, hook);
+        });
+        externalConnection.on('remote-channel-created', (incomingChannel: DataChannelStream) => {
+            const mirrorChannelStream = this.createDataChannel(incomingChannel.label);
+            proxyChannelPair(mirrorChannelStream, incomingChannel, hook); // mirror=internal, incoming=external
         });
 
         /// --- Media tracks: --- ///

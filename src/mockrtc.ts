@@ -4,7 +4,7 @@
  */
 
 import type { MockRTCHandlerBuilder } from "./handling/handler-builder";
-import { HandlerStepDefinition } from "./handling/handler-step-definitions";
+import { HandlerStepDefinition, BeforeDataChannelMessage } from "./handling/handler-step-definitions";
 import { MatcherDefinition } from "./matching/matcher-definitions";
 import type { ConnectionMetadata, MockRTCPeer } from "./mockrtc-peer";
 import { MockRTCRuleBuilder } from "./rule-builder";
@@ -26,6 +26,13 @@ export interface MockRTCOptions {
      * Defaults to false.
      */
     recordMessages?: boolean;
+
+    /**
+     * Optional callback applied to every data channel message in both directions
+     * for all proxied connections. Not serialized — only usable when constructing
+     * the server in-process (or via the WEBRTC_RULES env var).
+     */
+    beforeDataChannelMessage?: BeforeDataChannelMessage;
 }
 
 export interface MockRTCSessionDescription {
