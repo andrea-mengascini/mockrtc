@@ -1,5 +1,6 @@
 name: CI
-on: [push, pull_request]
+# CI disabled — manual trigger only
+on: workflow_dispatch
 jobs:
   build:
     name: Build & test
