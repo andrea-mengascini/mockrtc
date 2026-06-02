@@ -29,14 +29,98 @@ export type ParsedSDP = {
  * tracking logic for a generic connection. The MockRTCConnection subclass extends this and adds
  * logic to support control channels, proxying and other MockRTC-specific additions.
  */
+
+/**
+ * If MOCKRTC_PUBLIC_IP is set, inject a server-reflexive (srflx) candidate so that the
+ * remote peer (e.g. Zoom SFU on the public internet) can reach this server through NAT.
+ * Required when STUN is firewalled and node-datachannel only gathers private host candidates.
+ * Assumes 1:1 NAT where the public IP maps to the private IP on the same port.
+ */
+function injectPublicIpCandidate(sdp: string): string {
+    const publicIp = process.env.MOCKRTC_PUBLIC_IP;
+    if (!publicIp || !sdp) return sdp;
+
+    const lines = sdp.split('\r\n');
+    const patched: string[] = [];
+    let lastHostIp = '';
+    let lastHostPort = '';
+
+    for (const line of lines) {
+        if (line.startsWith('a=candidate:') && line.includes(' UDP ') && line.includes(' typ host')) {
+            const parts = line.split(' ');
+            if (parts.length >= 8) { lastHostIp = parts[4]; lastHostPort = parts[5]; }
+        }
+        if (line === 'a=end-of-candidates' && lastHostIp && lastHostPort) {
+            patched.push(
+                `a=candidate:99 1 UDP 1686052863 ${publicIp} ${lastHostPort}` +
+                ` typ srflx raddr ${lastHostIp} rport ${lastHostPort}`
+            );
+            lastHostIp = '';
+            lastHostPort = '';
+        }
+        patched.push(line);
+    }
+    return patched.join('\r\n');
+}
+
+// ── ICE diagnostics (opt-in via MOCKRTC_ICE_DEBUG) ──────────────────────────────
+// Traces why the external MockRTC↔SFU leg fails ICE behind NAT. Set MOCKRTC_ICE_DEBUG=1
+// for per-connection candidate/state tracing, or to a libdatachannel level
+// (Verbose|Debug|Info|Warning|Error|Fatal) to also stream the native ICE engine logs.
+const _ICE_DEBUG_RAW = process.env.MOCKRTC_ICE_DEBUG;
+const ICE_DEBUG = !!_ICE_DEBUG_RAW;
+const _NDC_LEVELS = ['Verbose', 'Debug', 'Info', 'Warning', 'Error', 'Fatal'];
+if (ICE_DEBUG) {
+    const level = _NDC_LEVELS.includes(_ICE_DEBUG_RAW!)
+        ? (_ICE_DEBUG_RAW as NodeDataChannel.LogLevel)
+        : 'Warning';
+    try {
+        NodeDataChannel.initLogger(level, (lvl, msg) => console.log(`[ndc:${lvl}] ${msg}`));
+    } catch (e) {
+        console.warn('[ice-debug] initLogger failed:', (e as Error).message);
+    }
+}
+
+// Optional single-interface ICE binding (see PeerConnection config below).
+const BIND_ADDRESS = process.env.MOCKRTC_BIND_ADDRESS || undefined;
+if (BIND_ADDRESS) console.log(`[MockRTC] Binding ICE to ${BIND_ADDRESS} (MOCKRTC_BIND_ADDRESS)`);
+
+function iceCandType(line: string): string {
+    const m = /typ (host|srflx|prflx|relay)/.exec(line);
+    return m ? m[1] : '?';
+}
+
+function candidateLinesFrom(sdp: string | undefined | null): string[] {
+    if (!sdp) return [];
+    return sdp.split(/\r?\n/).filter(l => l.startsWith('a=candidate:'));
+}
+
 export class RTCConnection extends EventEmitter {
 
     readonly id = randomUUID();
 
+    // For lifecycle timing diagnostics (ICE_DEBUG): how long from creation to connect/close.
+    private readonly _createdAt = Date.now();
+
     // Set to null when the connection is closed, as otherwise calling any method (including checking
     // the connection state) will segfault the process.
     private rawConn: NodeDataChannel.PeerConnection | null
-        = new NodeDataChannel.PeerConnection("MockRTCConnection", { iceServers: [], forceMediaTransport: true });
+        = new NodeDataChannel.PeerConnection("MockRTCConnection", {
+            // STUN is required so that MockRTC's server-side connection to the Zoom SFU includes
+            // the server's public reflexive address as an ICE candidate. Without it, only private
+            // IPs are advertised and the SFU (on the public internet) cannot reach MockRTC.
+            iceServers: [
+                { hostname: 'stun.l.google.com', port: 19302 },
+                { hostname: 'stun1.l.google.com', port: 19302 },
+            ],
+            forceMediaTransport: true,
+            // Bind ICE to a single interface when MOCKRTC_BIND_ADDRESS is set. On multi-homed hosts
+            // (e.g. a machine with a WireGuard tunnel), libdatachannel otherwise gathers host
+            // candidates on every interface and tries to send STUN from non-routable ones, producing
+            // ENETUNREACH (errno 101) and polluting ICE with unreachable candidates — which
+            // destabilises the external SFU leg. Pin it to the default-route interface instead.
+            ...(BIND_ADDRESS ? { bindAddress: BIND_ADDRESS } : {}),
+        });
 
     private remoteDescription: RTCSessionDescriptionInit & ParsedSDP | undefined;
     private localDescription: MockRTCSessionDescription & ParsedSDP | undefined;
@@ -107,6 +191,8 @@ export class RTCConnection extends EventEmitter {
         });
 
         this.on('connection-state-changed', (state) => {
+            if (ICE_DEBUG) console.log(`[lifecycle ${this.id.slice(0, 8)} ${
+                this.constructor.name}] state=${state} t+${Date.now() - this._createdAt}ms`);
             if (state === 'connected') {
                 this.emit('connection-connected');
             } else if (state === 'closed' || state === 'disconnected') {
@@ -114,6 +200,41 @@ export class RTCConnection extends EventEmitter {
                 this.remoteDescription = undefined;
                 this.localDescription = undefined;
             }
+        });
+
+        if (ICE_DEBUG) this.setupIceDebug();
+    }
+
+    // Per-connection ICE tracing. `MockRTCConnection` = internal browser-facing leg,
+    // base `RTCConnection` = external SFU-facing leg — the one failing behind NAT.
+    private _iceDbgLocalCands: string[] = [];
+    private setupIceDebug() {
+        const conn = this.rawConn!;
+        const tag = `${this.constructor.name}#${this.id.slice(0, 8)}`;
+
+        conn.onLocalCandidate((candidate, mid) => {
+            if (!this.rawConn) return;
+            this._iceDbgLocalCands.push(candidate);
+            console.log(`[ice-debug] ${tag} +localCand mid=${mid} typ=${iceCandType(candidate)} ${candidate}`);
+        });
+
+        conn.onIceStateChange((state) => {
+            if (!this.rawConn) return;
+            console.log(`[ice-debug] ${tag} iceState=${state}`);
+            if (state !== 'failed' && state !== 'connected' && state !== 'completed') return;
+
+            const localTypes = this._iceDbgLocalCands.map(iceCandType);
+            const remote = candidateLinesFrom(conn.remoteDescription()?.sdp);
+            const remoteTypes = remote.map(iceCandType);
+            const safe = <T>(fn: () => T): T | '?' => { try { return fn(); } catch { return '?'; } };
+            const pair = safe(() => conn.getSelectedCandidatePair());
+
+            console.log(`[ice-debug] ${tag} ICE ${state.toUpperCase()} — ` +
+                `local(${this._iceDbgLocalCands.length})=[${localTypes.join(',') || 'none'}] ` +
+                `remoteSFU(${remote.length})=[${remoteTypes.join(',') || 'none'}]`);
+            console.log(`[ice-debug] ${tag} selectedPair=${pair && pair !== '?' ? JSON.stringify(pair) : 'NONE'} ` +
+                `rtt=${safe(() => conn.rtt())} bytesRecv=${safe(() => conn.bytesReceived())}`);
+            for (const l of remote) console.log(`[ice-debug] ${tag}   R ${l.replace(/^a=/, '')}`);
         });
     }
 
@@ -152,11 +273,22 @@ export class RTCConnection extends EventEmitter {
         const trackStream = new MediaTrackStream(track);
         this.trackedMediaTracks.push({ stream: trackStream, isLocal: options.isLocal });
 
+        // Capture mid/type now: once the track closes the raw track is destroyed and reading
+        // `.mid`/`.type` throws ("called on destroyed track").
+        const trackMid = trackStream.mid;
+        const trackType = trackStream.type;
+
+        if (ICE_DEBUG) console.log(`[tracks ${this.id.slice(0, 8)}] +track mid=${
+            trackMid} type=${trackType} isLocal=${options.isLocal} (now ${
+            this.trackedMediaTracks.length})`);
+
         trackStream.on('close', () => {
             const trackIndex = this.trackedMediaTracks.findIndex(c => c.stream === trackStream);
             if (trackIndex !== -1) {
                 this.trackedMediaTracks.splice(trackIndex, 1);
             }
+            if (ICE_DEBUG) console.log(`[tracks ${this.id.slice(0, 8)}] -track mid=${
+                trackMid} type=${trackType} CLOSED (now ${this.trackedMediaTracks.length})`);
         });
 
         trackStream.on('error', (error) => {
@@ -216,6 +348,7 @@ export class RTCConnection extends EventEmitter {
 
         const sessionDescription = this.rawConn.localDescription() as MockRTCSessionDescription;
         setupChannel?.close(); // Close the temporary setup channel, if we created one
+        sessionDescription.sdp = injectPublicIpCandidate(sessionDescription.sdp ?? '');
         this.localDescription = {
             ...sessionDescription,
             parsedSdp: SDP.parse(sessionDescription.sdp ?? '')
@@ -258,23 +391,51 @@ export class RTCConnection extends EventEmitter {
         };
     }
 
-    async getMirroredLocalOffer(
-        sdpToMirror: string,
-        options: { addDataStream?: boolean } = {}
-    ): Promise<MockRTCSessionDescription> {
-        if (!this.rawConn) throw new Error("Can't get local description after connection is closed");
+    /**
+     * Adds a local media track for each relevant non-application m-line in the given SDP, copying its
+     * mid, type, direction and SSRCs. libdatachannel only includes a media track in a generated
+     * description if the track exists *before* that description is built — so this must run before
+     * setLocalDescription (when offering) or setRemoteDescription (when answering).
+     *
+     * `onlySendTracks` (used when answering) restricts creation to media the mirrored peer is sending
+     * (sendonly/sendrecv) — i.e. downlink streams that *we* must forward on to the browser. Inbound
+     * (recvonly) streams are received from the other peer via onTrack, so pre-creating them here would
+     * duplicate the track. This is the fix for remote-participant video/audio: when the browser is the
+     * offerer for a downlink stream, the answer path previously created no send-track, so MockRTC had
+     * nothing to forward the SFU's media into (black tiles / no remote audio).
+     */
+    private addMirroredMediaTracks(sdpToMirror: string, options: { onlySendTracks?: boolean } = {}) {
+        if (!this.rawConn) throw new Error("Can't add media tracks after connection is closed");
 
-        const offerToMirror = SDP.parse(sdpToMirror);
-
-        const mediaStreamsToMirror = offerToMirror.media.filter(media => media.type !== 'application');
-        const shouldMirrorDataStream = offerToMirror.media.some(media => media.type === 'application');
+        const mediaStreamsToMirror = SDP.parse(sdpToMirror).media.filter(media => media.type !== 'application');
 
         mediaStreamsToMirror.forEach((mediaToMirror) => {
-            // Skip media tracks that we already have
-            if (this.mediaTracks.find(({ mid }) => mid === mediaToMirror.mid!)) return;
-
             const mid = mediaToMirror.mid!.toString();
-            const direction = sdpDirectionToNDCDirection(mediaToMirror.direction);
+
+            // Skip media tracks that we already have
+            if (this.mediaTracks.find((track) => track.mid === mid)) return;
+
+            // When answering, only create tracks for media the peer sends to us to forward on.
+            // Note: an m-line with no explicit direction defaults to sendrecv (RFC 3264), and
+            // sdp-transform reports that as `undefined` — so we must exclude only *explicit*
+            // recvonly/inactive lines, not treat undefined as non-sending (that bug left some
+            // downlink video tracks uncreated → still-black tiles).
+            if (options.onlySendTracks &&
+                (mediaToMirror.direction === 'recvonly' || mediaToMirror.direction === 'inactive')
+            ) {
+                if (ICE_DEBUG) console.log(`[tracks ${this.id.slice(0, 8)}] skip mid=${mid} type=${
+                    mediaToMirror.type} dir=${mediaToMirror.direction} (not a send track)`);
+                return;
+            }
+
+            // The answer to the browser's recvonly offer must be sendonly (we only forward SFU media
+            // down to the browser on these tracks); for offers, preserve the mirrored direction.
+            const direction = options.onlySendTracks
+                ? NodeDataChannel.Direction.SendOnly
+                : sdpDirectionToNDCDirection(mediaToMirror.direction);
+
+            if (ICE_DEBUG) console.log(`[tracks ${this.id.slice(0, 8)}] addTrack mid=${mid} type=${
+                mediaToMirror.type} srcDir=${mediaToMirror.direction} ndcDir=${direction}`);
 
             const media = mediaToMirror.type === 'video'
                 ? new NodeDataChannel.Video(mid, direction)
@@ -308,6 +469,22 @@ export class RTCConnection extends EventEmitter {
             const track = this.rawConn!.addTrack(media);
             this.trackNewMediaTrack(track, { isLocal: true });
         });
+    }
+
+    async getMirroredLocalOffer(
+        sdpToMirror: string,
+        options: { addDataStream?: boolean } = {}
+    ): Promise<MockRTCSessionDescription> {
+        if (!this.rawConn) throw new Error("Can't get local description after connection is closed");
+
+        const offerToMirror = SDP.parse(sdpToMirror);
+
+        const mediaStreamsToMirror = offerToMirror.media.filter(media => media.type !== 'application');
+        const shouldMirrorDataStream = offerToMirror.media.some(media => media.type === 'application');
+
+        // When offering, mirror every media line (both directions): we're re-creating the peer's
+        // whole offer onward, so all m-lines need a local track to appear in the description.
+        this.addMirroredMediaTracks(sdpToMirror);
 
         let setupChannel: NodeDataChannel.DataChannel | undefined;
         const channelRequiredForDescription = this.rawConn.gatheringState() === 'new' &&
@@ -336,8 +513,9 @@ export class RTCConnection extends EventEmitter {
         const localDesc = this.rawConn.localDescription()!;
         setupChannel?.close(); // Close the temporary setup channel, if we created one
 
-        const offerSDP = SDP.parse(localDesc.sdp);
+        const offerSDP = SDP.parse(injectPublicIpCandidate(localDesc.sdp));
         mirrorMediaParams(offerToMirror, offerSDP);
+        normalizeBundledCodecParams(offerSDP);
         localDesc.sdp = SDP.write(offerSDP);
 
         this.localDescription = {
@@ -349,6 +527,7 @@ export class RTCConnection extends EventEmitter {
 
     async getMirroredLocalAnswer(sdpToMirror: string): Promise<MockRTCSessionDescription> {
         const localDesc = this.rawConn!.localDescription()!;
+        localDesc.sdp = injectPublicIpCandidate(localDesc.sdp ?? '');
 
         const answerToMirror = SDP.parse(sdpToMirror);
         const answerSDP = SDP.parse(localDesc.sdp!);
@@ -416,6 +595,14 @@ export class RTCConnection extends EventEmitter {
                 };
             }
 
+            if (options.mirrorSDP) {
+                // Create send-tracks for the downlink media (what the mirrored peer/SFU is sending)
+                // *before* setRemoteDescription, so libdatachannel includes them in the answer it
+                // generates. Without this, the answer carries no track for the browser to receive on,
+                // so MockRTC has nothing to forward the SFU's media into — remote tiles stay black.
+                this.addMirroredMediaTracks(options.mirrorSDP, { onlySendTracks: true });
+            }
+
             this.setRemoteDescription(offer);
 
             if (options.mirrorSDP) {
@@ -452,6 +639,43 @@ function sdpDirectionToNDCDirection(direction: SDP.SharedAttributes['direction']
         return NodeDataChannel.Direction.Unknown;
     }
 };
+
+/**
+ * Normalizes fmtp parameters for duplicate payload types across m-sections within the same
+ * BUNDLE group. Chrome rejects SDP offers where the same payload type appears in multiple
+ * BUNDLE m-sections with different fmtp configs (INVALID_PARAMETER / "codec collision").
+ * First occurrence wins — all subsequent m-sections in the group get the same fmtp config.
+ */
+function normalizeBundledCodecParams(sdp: SDP.SessionDescription) {
+    if (!sdp.groups) return;
+
+    for (const group of sdp.groups) {
+        if (group.type !== 'BUNDLE') continue;
+
+        const bundleMids = new Set(String(group.mids).split(' '));
+        const bundledMedia = sdp.media.filter(m =>
+            m.mid != null && bundleMids.has(m.mid.toString())
+        );
+
+        // First fmtp config seen for each payload type becomes canonical
+        const canonical = new Map<number, string>();
+        for (const m of bundledMedia) {
+            if (!m.fmtp) continue;
+            for (const entry of m.fmtp) {
+                if (!canonical.has(entry.payload)) canonical.set(entry.payload, entry.config);
+            }
+        }
+
+        // Apply canonical config to every fmtp entry in the group
+        for (const m of bundledMedia) {
+            if (!m.fmtp) continue;
+            m.fmtp = m.fmtp.map(entry => ({
+                payload: entry.payload,
+                config: canonical.get(entry.payload) ?? entry.config
+            }));
+        }
+    }
+}
 
 /**
  * Takes two parsed descriptions (typically a real description we want to mock, and our own current

@@ -133,10 +133,38 @@ export function hookWebRTCConnection(conn: RTCPeerConnection, mockPeer: MockRTCP
         if (localDescription.type === 'offer') {
             pendingLocalDescription = localDescription;
             selectedDescription = pendingCreatedOffers[localDescription.sdp!];
+            if (!selectedDescription) {
+                // SDP was modified between createOffer and setLocalDescription (e.g. Zoom rewrites
+                // candidates). Fall back to the most recently created pending offer so we still
+                // connect through MockRTC rather than bypassing it entirely.
+                const keys = Object.keys(pendingCreatedOffers);
+                if (keys.length > 0) {
+                    const lastKey = keys[keys.length - 1];
+                    selectedDescription = pendingCreatedOffers[lastKey];
+                    delete pendingCreatedOffers[lastKey];
+                }
+            }
+            if (!selectedDescription) {
+                await _setLocalDescription(localDescription);
+                return;
+            }
             const { realOffer } = selectedDescription;
             await _setLocalDescription(realOffer);
         } else {
             selectedDescription = pendingCreatedAnswers[localDescription.sdp!];
+            if (!selectedDescription) {
+                // Same fallback for answers modified post-createAnswer.
+                const keys = Object.keys(pendingCreatedAnswers);
+                if (keys.length > 0) {
+                    const lastKey = keys[keys.length - 1];
+                    selectedDescription = pendingCreatedAnswers[lastKey];
+                    delete pendingCreatedAnswers[lastKey];
+                }
+            }
+            if (!selectedDescription) {
+                await _setLocalDescription(localDescription);
+                return;
+            }
             const { realAnswer } = selectedDescription;
             await Promise.all([
                 // Complete the mock side of the internal connection:

@@ -45,8 +45,6 @@ export class DataChannelStream extends stream.Duplex {
             // read/wrote-data events, used for MockRTC event subscriptions. These aren't
             // buffered, and this ensures that those events do not consume data that will
             // separately be processed by handler steps.
-            const size = Buffer.isBuffer(msg) ? msg.byteLength : msg.length;
-            console.log(`[MockRTC] DataChannelStream onMessage — channel="${this.channelLabel}" ${Buffer.isBuffer(msg) ? 'binary' : 'text'} ${size} bytes`);
             this.emit('read-data', msg);
 
             this.pendingMessages.push(msg);

@@ -38,7 +38,6 @@ function makeTransformPipe(
         transform(chunk: string | Buffer, _enc: string, done: (err?: Error | null, data?: any) => void) {
             const isBinary = Buffer.isBuffer(chunk);
             const content = isBinary ? chunk as Buffer : Buffer.from(chunk as string);
-            console.log(`[MockRTC] Transform chunk fromPeer=${fromPeer} label="${src.label}" isBinary=${isBinary} size=${content.length}`);
 
             Promise.resolve(hook({ content, isBinary, channelLabel: src.label, fromPeer }, injection))
                 .then((result: RTCDataChannelMessageResult | void) => {
@@ -63,7 +62,6 @@ function proxyChannelPair(
     externalCh: DataChannelStream,
     hook?: BeforeDataChannelMessage
 ): void {
-    console.log(`[MockRTC] proxyChannelPair label="${internalCh.label}" hook=${!!hook}`);
     if (!hook) {
         internalCh.pipe(externalCh);
         externalCh.pipe(internalCh);
@@ -123,6 +121,8 @@ export class MockRTCConnection extends RTCConnection {
                         externalConnection.waitUntilConnected().then(() => {
                             this.externalConnection = externalConnection;
                             this.emit('external-connection-attached', this.externalConnection);
+                        }).catch((err) => {
+                            console.warn("External connection failed, cannot attach:", err.message || err);
                         });
 
                         // We don't necessarily proxy traffic through to the external connection at this
@@ -193,8 +193,15 @@ export class MockRTCConnection extends RTCConnection {
 
 
         // Mirror connection closure:
-        this.on('connection-closed', () => externalConnection.close());
-        externalConnection.on('connection-closed', () => this.close());
+        const closeDebug = !!(process.env.MOCKRTC_RELAY_DEBUG || process.env.MOCKRTC_ICE_DEBUG);
+        this.on('connection-closed', () => {
+            if (closeDebug) console.log(`[lifecycle ${this.id.slice(0, 8)}] INTERNAL (browser) closed first → tearing down external`);
+            externalConnection.close();
+        });
+        externalConnection.on('connection-closed', () => {
+            if (closeDebug) console.log(`[lifecycle ${this.id.slice(0, 8)}] EXTERNAL (SFU) closed first → tearing down internal`);
+            this.close();
+        });
 
         /// --- Data channels: --- ///
 
@@ -223,29 +230,80 @@ export class MockRTCConnection extends RTCConnection {
 
         /// --- Media tracks: --- ///
 
-        // Note that while data channels will *not* have been negotiated before this point, so
-        // we can always assume that mock data channels need mirroring, media tracks are negotiated
-        // in the SDP, not in-band, and so any media track could already exist on the other side.
+        // Unlike data channels (negotiated in-band, so they never exist before this point), media
+        // tracks are negotiated in the SDP. Crucially, in SFU topologies (e.g. Zoom) tracks are added
+        // *incrementally via renegotiation* as remote participants enable their camera/mic — long after
+        // proxying begins. A one-shot `forEach` over the tracks present at setup time therefore relays
+        // only the local outbound track (so a participant sees themselves) and silently drops every
+        // remote participant's track (so all other tiles stay black).
+        //
+        // Instead we relay dynamically: track both sides' tracks by mid, and pipe a pair together as
+        // soon as the matching mid appears on each side — including tracks created later by renegotiation,
+        // mirroring how data channels above listen for `remote-channel-created`.
 
-        // For each track on the internal connection, proxy it to the corresponding external track:
-        this.mediaTracks.forEach((track: MediaTrackStream) => {
-            const externalStream = externalConnection.mediaTracks.find(({ mid }) => mid === track.mid);
-            if (externalStream) {
-                if (externalStream.type === track.type) {
-                    track.pipe(externalStream).pipe(track);
-                } else {
-                    throw new Error(`Mock & external streams with mid ${track.mid} have mismatched types (${
-                        track.type
-                    }/${
-                        externalStream.type
-                    })`);
-                }
-            } else {
-                // A mismatch in media streams means the external & mock peer negotiation isn't in sync!
-                // For now we just reject this case - later we should try to prompt a renegotiation.
-                throw new Error(`Mock has ${track.type} ${track.mid} but external does not`);
+        // Diagnostics: trace track registration & pairing so we can tell, per connection, whether
+        // remote media tracks ever arrive on both legs and get relayed. Gated on MOCKRTC_RELAY_DEBUG
+        // (or the existing MOCKRTC_ICE_DEBUG) to stay silent in normal runs.
+        const relayDebug = !!(process.env.MOCKRTC_RELAY_DEBUG || process.env.MOCKRTC_ICE_DEBUG);
+        const relayTag = `[relay ${this.id.slice(0, 8)}]`;
+        const rlog = (...args: any[]) => { if (relayDebug) console.log(relayTag, ...args); };
+
+        const pendingMockTracks = new Map<string, MediaTrackStream>();
+        const pendingExternalTracks = new Map<string, MediaTrackStream>();
+        const pipedMids = new Set<string>();
+
+        const tryPipeTrack = (mid: string) => {
+            if (pipedMids.has(mid)) return;
+            const mockTrack = pendingMockTracks.get(mid);
+            const externalTrack = pendingExternalTracks.get(mid);
+            if (!mockTrack || !externalTrack) {
+                rlog(`mid ${mid} waiting for pair (mock=${!!mockTrack} external=${!!externalTrack})`);
+                return; // Wait until both sides have negotiated this mid.
             }
-        });
+
+            pendingMockTracks.delete(mid);
+            pendingExternalTracks.delete(mid);
+
+            if (mockTrack.type !== externalTrack.type) {
+                // Negotiation mismatch — skip just this track rather than throwing, so one bad track
+                // can't tear down the whole connection (including the data channel proxy).
+                console.warn(`[MockRTC] Skipping media relay for mid ${mid}: mismatched types (${
+                    mockTrack.type
+                }/${
+                    externalTrack.type
+                })`);
+                return;
+            }
+
+            pipedMids.add(mid);
+            rlog(`PIPED mid ${mid} (${mockTrack.type}) mock<->external`);
+            // Bidirectional relay: external (SFU) → mock (browser) and back. RTP is forwarded opaquely.
+            mockTrack.pipe(externalTrack).pipe(mockTrack);
+        };
+
+        const registerMockTrack = (track: MediaTrackStream) => {
+            if (track.mid == null) return;
+            rlog(`+mock track mid=${track.mid} type=${track.type}`);
+            pendingMockTracks.set(track.mid, track);
+            tryPipeTrack(track.mid);
+        };
+        const registerExternalTrack = (track: MediaTrackStream) => {
+            if (track.mid == null) return;
+            rlog(`+external track mid=${track.mid} type=${track.type}`);
+            pendingExternalTracks.set(track.mid, track);
+            tryPipeTrack(track.mid);
+        };
+
+        rlog(`proxy setup: mock has ${this.mediaTracks.length} track(s), external has ${
+            externalConnection.mediaTracks.length} track(s)`);
+
+        // Relay tracks already negotiated at setup time...
+        this.mediaTracks.forEach(registerMockTrack);
+        externalConnection.mediaTracks.forEach(registerExternalTrack);
+
+        // ...and any tracks added later via renegotiation (the SFU/remote-participant case):
+        this.on('track-created', registerMockTrack);
+        externalConnection.on('track-created', registerExternalTrack);
     }
 
 }

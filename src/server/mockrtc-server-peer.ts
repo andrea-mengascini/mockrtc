@@ -119,8 +119,6 @@ export class MockRTCServerPeer implements MockRTCPeer {
 
                     const emitMessage = (direction: 'sent' | 'received') => (data: Buffer | string) => {
                         const isBinary = Buffer.isBuffer(data);
-                        const size = isBinary ? (data as Buffer).byteLength : (data as string).length;
-                        console.log(`[MockRTC] DataChannel message ${direction} — label="${channelStream.label}" ${isBinary ? 'binary' : 'text'} ${size} bytes`);
 
                         const content: Buffer = isBinary
                             ? data
