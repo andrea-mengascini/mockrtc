@@ -188,6 +188,10 @@ export class PeerProxyStep extends Serializable implements HandlerStepDefinition
 
     protected externalConnections: RTCConnection[] = []; // Set here so it can be used in impl subclass
 
+    // Server-level beforeDataChannelMessage is injected here too (not just DynamicProxy), so the
+    // documented "applies to all proxied connections" holds for thenForwardTo as well.
+    public beforeDataChannelMessage?: BeforeDataChannelMessage;
+
     protected getAnswer: (offer: MockRTCSessionDescription) => Promise<RTCSessionDescriptionInit>;
 
     constructor(

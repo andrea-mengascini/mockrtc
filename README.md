@@ -265,6 +265,43 @@ Here you can see the local connection receives the injected message, then the mo
 
 If you wan to do this automatically for all WebRTC connections, you can also use the `WebRTC.hookAllWebRTC(mockPeer)` function, which will wrap the global `RTCPeerConnection` constructor to automatically apply this hook to every WebRTC connection when it's created, to redirect _all_ traffic through the given mock peer. Note that this only applies to new WebRTC connections, so this should be called before your first WebRTC connection is created.
 
+### On-the-fly data channel editing
+
+Pass a server-level `beforeDataChannelMessage` callback to `getLocal(...)` (or set the `WEBRTC_RULES`
+env var) to inspect/modify/drop/inject every proxied data channel message, in both directions. It
+applies to **all** proxied connections (`thenPassThrough` and `thenForwardTo`):
+
+```js
+const mockRTC = MockRTC.getLocal({
+    beforeDataChannelMessage: (message, channel) => {
+        const text = message.content.toString('utf8');     // message.fromPeer: 'internal' | 'external'
+        if (text.includes('SECRET')) return { action: 'drop' };
+        if (text.includes('hello')) return { action: 'forward', content: text.replace('hello', 'HACKED') };
+        // channel.toPeer(...) / channel.toRemote(...) inject messages in either direction
+    }
+});
+```
+
+A standalone node-only check lives in `scratch/verify.mjs` (proxy + match-replace/drop/inject + binary burst).
+
+### ICE / TURN configuration
+
+The server-side connection defaults to Google STUN. Configure ICE (incl. TURN relay) via env vars:
+
+```bash
+export MOCKRTC_ICE_SERVERS='[{"hostname":"turn.example.com","port":3478,"username":"u","password":"p","relayType":"TurnUdp"}]'
+export MOCKRTC_ICE_POLICY=relay   # optional: force relay-only (verifies TURN actually works)
+```
+
+To verify the relay path locally with a throwaway coturn (`sudo apt-get install -y coturn`):
+```
+turnserver -n --no-cli --no-tls --no-dtls \
+  --listening-port=3480 --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+  --realm=mockrtc.test --user=mock:mockpass --lt-cred-mech --fingerprint \
+  --min-port=49200 --max-port=49250 --verbose
+```
+then point `MOCKRTC_ICE_SERVERS` at `127.0.0.1:3480` (user `mock` / `mockpass`).
+
 ### API Reference Docs
 
 For more details, see the [MockRTC reference docs](https://httptoolkit.github.io/mockrtc/).

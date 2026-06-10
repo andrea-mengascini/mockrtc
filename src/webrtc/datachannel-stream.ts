@@ -41,13 +41,17 @@ export class DataChannelStream extends stream.Duplex {
         this.channelProtocol = rawChannel.getProtocol();
 
         rawChannel.onMessage((msg) => {
+            // node-datachannel ≥0.13 may hand binary messages back as ArrayBuffer; normalize to Buffer
+            // so the rest of the stream (and handler steps) keep seeing string | Buffer.
+            const message: string | Buffer = msg instanceof ArrayBuffer ? Buffer.from(msg) : msg;
+
             // Independently of the stream and it's normal events, we also fire our own
             // read/wrote-data events, used for MockRTC event subscriptions. These aren't
             // buffered, and this ensures that those events do not consume data that will
             // separately be processed by handler steps.
-            this.emit('read-data', msg);
+            this.emit('read-data', message);
 
-            this.pendingMessages.push(msg);
+            this.pendingMessages.push(message);
             this.flushPendingMessages();
         });
 

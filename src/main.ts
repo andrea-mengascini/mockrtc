@@ -91,8 +91,8 @@ export {
  *
  * @category API
  */
-export function getLocal(): MockRTC {
-    return new MockRTCServer();
+export function getLocal(options: MockRTCOptions = {}): MockRTC {
+    return new MockRTCServer(options);
 }
 
 /**

@@ -175,10 +175,16 @@ export class MockRTCServer extends MockRTCBase implements MockRTC {
     // Peer definition API:
 
     private injectHook(step: HandlerStepImpl): void {
-        if (step.type === 'rtc-dynamic-proxy' && this.options.beforeDataChannelMessage) {
-            const dynStep = step as DynamicProxyStepImpl;
-            if (!dynStep.beforeDataChannelMessage) {
-                dynStep.beforeDataChannelMessage = this.options.beforeDataChannelMessage;
+        // The server-level beforeDataChannelMessage applies to every proxied connection — both the
+        // dynamic proxy (thenPassThrough, the browser-hook interception path) and the explicit peer
+        // proxy (thenForwardTo). Inject it into whichever proxy step we're materialising.
+        if (
+            (step.type === 'rtc-dynamic-proxy' || step.type === 'rtc-peer-proxy') &&
+            this.options.beforeDataChannelMessage
+        ) {
+            const proxyStep = step as DynamicProxyStepImpl;
+            if (!proxyStep.beforeDataChannelMessage) {
+                proxyStep.beforeDataChannelMessage = this.options.beforeDataChannelMessage;
             }
         }
     }

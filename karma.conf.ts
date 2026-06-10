@@ -74,13 +74,22 @@ module.exports = function(config: any) {
         customLaunchers: {
             ChromeHeadlessWithFakeMedia: {
                 base: 'ChromeHeadless',
-                flags: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream']
+                flags: [
+                    '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
+                    // Needed to run headless Chromium in this (containerised/CI) environment,
+                    // otherwise the browser connects then hangs ("ping timeout", no tests run).
+                    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'
+                ]
             },
             ChromeWithFakeMedia: {
                 base: 'Chrome',
                 flags: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream']
             }
         },
+
+        browserNoActivityTimeout: 120000,
+        browserConsoleLogOptions: { level: 'debug', format: '%b %T: %m', terminal: true },
+        client: { captureConsole: true },
 
         autoWatch: CONTINUOUS,
         singleRun: !CONTINUOUS,

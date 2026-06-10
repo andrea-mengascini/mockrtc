@@ -37,6 +37,10 @@ export type ParsedSDP = {
  * Assumes 1:1 NAT where the public IP maps to the private IP on the same port.
  */
 function injectPublicIpCandidate(sdp: string): string {
+    // Browser-like mode: Zoom gives its RTCPeerConnections empty iceServers and reaches the SFU with
+    // host candidates + peer-reflexive discovery. Injecting a srflx candidate (and using STUN) makes
+    // libjuice prefer a STUN-derived mapping that is dead under symmetric NAT (bytesRecv=0). Skip it.
+    if (process.env.MOCKRTC_NO_STUN === '1') return sdp;
     const publicIp = process.env.MOCKRTC_PUBLIC_IP;
     if (!publicIp || !sdp) return sdp;
 
@@ -85,6 +89,41 @@ if (ICE_DEBUG) {
 const BIND_ADDRESS = process.env.MOCKRTC_BIND_ADDRESS || undefined;
 if (BIND_ADDRESS) console.log(`[MockRTC] Binding ICE to ${BIND_ADDRESS} (MOCKRTC_BIND_ADDRESS)`);
 
+// Browser-like ICE: Zoom configures RTCPeerConnection with empty iceServers (no STUN/TURN) and relies
+// on host candidates + peer-reflexive discovery against the SFU. Mirror that — STUN here makes libjuice
+// pick a STUN mapping that's dead under symmetric NAT (bytesRecv=0, SCTP fails ~35s). MOCKRTC_NO_STUN=1.
+const NO_STUN = process.env.MOCKRTC_NO_STUN === '1';
+if (NO_STUN) console.log('[MockRTC] Browser-like ICE: empty iceServers, no srflx injection (MOCKRTC_NO_STUN=1)');
+
+// ICE server configuration. By default we inject Google STUN (so the server-side leg advertises
+// its public reflexive address). For peers that require relaying (symmetric NAT / TURN-only SFUs)
+// the external leg needs TURN — set MOCKRTC_ICE_SERVERS to a JSON array of node-datachannel ice
+// server entries, e.g.
+//   MOCKRTC_ICE_SERVERS='[{"hostname":"turn.example.com","port":3478,"username":"u","password":"p","relayType":"TurnUdp"}]'
+// and optionally MOCKRTC_ICE_POLICY=relay to force relay-only (for verifying TURN works).
+const DEFAULT_STUN = [
+    { hostname: 'stun.l.google.com', port: 19302 },
+    { hostname: 'stun1.l.google.com', port: 19302 },
+];
+function resolveIceServers(): any[] {
+    if (NO_STUN) return [];
+    const raw = process.env.MOCKRTC_ICE_SERVERS;
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) throw new Error('not an array');
+            console.log(`[MockRTC] Using ${parsed.length} custom ICE server(s) from MOCKRTC_ICE_SERVERS`);
+            return parsed;
+        } catch (e: any) {
+            console.warn(`[MockRTC] Ignoring invalid MOCKRTC_ICE_SERVERS (${e.message}); falling back to default STUN`);
+        }
+    }
+    return DEFAULT_STUN;
+}
+const ICE_SERVERS = resolveIceServers();
+const ICE_POLICY = process.env.MOCKRTC_ICE_POLICY; // 'all' | 'relay'
+if (ICE_POLICY) console.log(`[MockRTC] iceTransportPolicy=${ICE_POLICY} (MOCKRTC_ICE_POLICY)`);
+
 function iceCandType(line: string): string {
     const m = /typ (host|srflx|prflx|relay)/.exec(line);
     return m ? m[1] : '?';
@@ -108,11 +147,10 @@ export class RTCConnection extends EventEmitter {
         = new NodeDataChannel.PeerConnection("MockRTCConnection", {
             // STUN is required so that MockRTC's server-side connection to the Zoom SFU includes
             // the server's public reflexive address as an ICE candidate. Without it, only private
-            // IPs are advertised and the SFU (on the public internet) cannot reach MockRTC.
-            iceServers: [
-                { hostname: 'stun.l.google.com', port: 19302 },
-                { hostname: 'stun1.l.google.com', port: 19302 },
-            ],
+            // IPs are advertised and the SFU (on the public internet) cannot reach MockRTC. TURN
+            // (relay) can be added via MOCKRTC_ICE_SERVERS for peers that require relaying.
+            iceServers: ICE_SERVERS,
+            ...(ICE_POLICY ? { iceTransportPolicy: ICE_POLICY as 'all' | 'relay' } : {}),
             forceMediaTransport: true,
             // Bind ICE to a single interface when MOCKRTC_BIND_ADDRESS is set. On multi-homed hosts
             // (e.g. a machine with a WireGuard tunnel), libdatachannel otherwise gathers host
@@ -315,7 +353,10 @@ export class RTCConnection extends EventEmitter {
         };
         const { type: offerType, sdp: offerSdp } = description;
         if (!offerSdp) throw new Error("Cannot set MockRTC peer description without providing an SDP");
-        this.rawConn.setRemoteDescription(offerSdp, offerType[0].toUpperCase() + offerType.slice(1) as any);
+        // node-datachannel ≥0.13 expects a lowercase DescriptionType ('offer'/'answer'), which is exactly
+        // the WebRTC RTCSdpType. Older builds wanted a capitalized enum value, hence the previous
+        // uppercasing — that now silently breaks remote-description handling, so pass the type as-is.
+        this.rawConn.setRemoteDescription(offerSdp, offerType as any);
     }
 
     /**
@@ -431,7 +472,7 @@ export class RTCConnection extends EventEmitter {
             // The answer to the browser's recvonly offer must be sendonly (we only forward SFU media
             // down to the browser on these tracks); for offers, preserve the mirrored direction.
             const direction = options.onlySendTracks
-                ? NodeDataChannel.Direction.SendOnly
+                ? 'SendOnly' as NodeDataChannel.Direction
                 : sdpDirectionToNDCDirection(mediaToMirror.direction);
 
             if (ICE_DEBUG) console.log(`[tracks ${this.id.slice(0, 8)}] addTrack mid=${mid} type=${
@@ -498,7 +539,9 @@ export class RTCConnection extends EventEmitter {
             setupChannel = this.rawConn.createDataChannel('mockrtc.setup-channel');
         }
 
-        this.rawConn.setLocalDescription(NodeDataChannel.DescriptionType.Offer);
+        // node-datachannel ≥0.13 takes a lowercase DescriptionType string ('offer'); older builds
+        // exported a DescriptionType enum (.Offer). We're on 0.32.x.
+        this.rawConn.setLocalDescription('offer');
         await new Promise<void>((resolve) => {
             this.rawConn!.onGatheringStateChange((state) => {
                 if (state === 'complete') resolve();
@@ -629,14 +672,14 @@ export class RTCConnection extends EventEmitter {
 }
 
 function sdpDirectionToNDCDirection(direction: SDP.SharedAttributes['direction']): NodeDataChannel.Direction {
-    if (direction === 'inactive') return NodeDataChannel.Direction.Inactive;
+    if (direction === 'inactive') return 'Inactive';
     else if (direction?.length === 8) {
         return direction[0].toUpperCase() +
             direction.slice(1, 4) +
             direction[4].toUpperCase() +
             direction.slice(5) as NodeDataChannel.Direction;
     } else {
-        return NodeDataChannel.Direction.Unknown;
+        return 'Unknown';
     }
 };
 

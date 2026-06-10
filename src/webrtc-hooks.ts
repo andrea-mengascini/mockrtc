@@ -268,11 +268,30 @@ export function hookWebRTCConnection(conn: RTCPeerConnection, mockPeer: MockRTCP
  *
  * @category API
  */
+// DIAGNOSTIC toggle: logs the ICE config each page passes (TURN presence etc.). Kept for the
+// WebRTC/TURN investigation but disabled by default — flip to true to re-enable. Runs in-browser,
+// so this is a compile-time flag rather than an env var.
+const LOG_ICE_CONFIG = false;
+
 export function hookAllWebRTC(mockPeer: MockRTCPeer) {
     // The original constructor
     const _RTCPeerConnection = window.RTCPeerConnection;
 
     window.RTCPeerConnection = function (this: RTCPeerConnection) {
+        // DIAGNOSTIC (2026-06-03): log the ICE config the page (e.g. Zoom) passes, to confirm whether
+        // it relies on TURN servers that MockRTC's external leg currently lacks.
+        if (LOG_ICE_CONFIG) try {
+            const cfg = (arguments as any)[0] as RTCConfiguration | undefined;
+            const servers = (cfg && cfg.iceServers) || [];
+            const summary = servers.map((s: RTCIceServer) => ({
+                urls: s.urls,
+                hasCredential: !!(s as any).credential
+            }));
+            const hasTurn = JSON.stringify(servers).toLowerCase().includes('turn:') ||
+                            JSON.stringify(servers).toLowerCase().includes('turns:');
+            console.log('[MockRTC-iceconfig] hasTURN=' + hasTurn + ' iceServers=' + JSON.stringify(summary));
+        } catch (e) { /* ignore */ }
+
         const connection = new _RTCPeerConnection(...arguments);
         hookWebRTCConnection(connection, mockPeer);
         return connection;
