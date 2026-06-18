@@ -24,6 +24,57 @@ export type ParsedSDP = {
     parsedSdp: SDP.SessionDescription;
 };
 
+// Opt-in libdatachannel logging (MOCKRTC_NDC_LOG=Verbose|Debug|Info|Warning) to diagnose ICE/TURN.
+if (process.env.MOCKRTC_NDC_LOG) {
+    try { (NodeDataChannel as any).initLogger(process.env.MOCKRTC_NDC_LOG); } catch (e) { /* ignore */ }
+}
+
+/**
+ * Convert browser RTCIceServer[] ({ urls, username, credential }) to the format
+ * node-datachannel expects ({ hostname, port, username?, password? }[]). Used so
+ * MockRTC's external leg can gather srflx/relay candidates via the app's STUN/TURN
+ * and be reachable by a remote (e.g. a cloud SFU) behind NAT, instead of advertising
+ * only host candidates (which a remote SFU can't reach).
+ */
+export function toNodeDataChannelIceServers(servers: unknown): Array<{
+    hostname: string; port: number; username?: string; password?: string; relayType?: string;
+}> {
+    if (!Array.isArray(servers)) return [];
+    const out: Array<{ hostname: string; port: number; username?: string; password?: string; relayType?: string }> = [];
+    for (const s of servers as any[]) {
+        if (!s) continue;
+        const urls: string[] = Array.isArray(s.urls) ? s.urls : (s.urls ? [s.urls] : []);
+        for (const raw of urls) {
+            if (typeof raw !== 'string') continue;
+            const m = /^(stun|stuns|turn|turns):([^?]+)/i.exec(raw.trim());
+            if (!m) continue;
+            const scheme = m[1].toLowerCase();
+            let hostport = m[2];
+            const at = hostport.lastIndexOf('@');
+            if (at >= 0) hostport = hostport.slice(at + 1);
+            let hostname = hostport;
+            let port = (scheme === 'turns' || scheme === 'stuns') ? 5349 : 3478;
+            const colon = hostport.lastIndexOf(':');
+            if (colon > 0 && /^\d+$/.test(hostport.slice(colon + 1))) {
+                hostname = hostport.slice(0, colon);
+                port = parseInt(hostport.slice(colon + 1), 10);
+            }
+            const server: { hostname: string; port: number; username?: string; password?: string; relayType?: string } = { hostname, port };
+            if (scheme.startsWith('turn')) {
+                if (s.username != null) server.username = String(s.username);
+                if (s.credential != null) server.password = String(s.credential);
+                // relayType makes node-datachannel/libjuice ALLOCATE a TURN relay (vs treating it as STUN).
+                const transport = (/transport=(\w+)/i.exec(raw) || [])[1];
+                server.relayType = scheme === 'turns'
+                    ? 'TurnTls'
+                    : (transport && transport.toLowerCase() === 'tcp' ? 'TurnTcp' : 'TurnUdp');
+            }
+            out.push(server);
+        }
+    }
+    return out;
+}
+
 /**
  * An RTC connection is a single connection. This base class defines the raw connection management and
  * tracking logic for a generic connection. The MockRTCConnection subclass extends this and adds
@@ -35,11 +86,14 @@ export class RTCConnection extends EventEmitter {
 
     // Set to null when the connection is closed, as otherwise calling any method (including checking
     // the connection state) will segfault the process.
-    private rawConn: NodeDataChannel.PeerConnection | null
-        = new NodeDataChannel.PeerConnection("MockRTCConnection", { iceServers: [], forceMediaTransport: true });
+    private rawConn: NodeDataChannel.PeerConnection | null;
 
     private remoteDescription: RTCSessionDescriptionInit & ParsedSDP | undefined;
     private localDescription: MockRTCSessionDescription & ParsedSDP | undefined;
+
+    // Trickled remote ICE candidates that arrive before the remote description is set
+    // (node-datachannel requires the remote description first). Flushed in setRemoteDescription.
+    private pendingRemoteCandidates: Array<{ candidate: string; mid: string }> = [];
 
     private _connectionMetadata: ConnectionMetadata = {};
     public get metadata() {
@@ -84,8 +138,15 @@ export class RTCConnection extends EventEmitter {
             .map(track => track.stream);
     }
 
-    constructor() {
+    constructor(connConfig: { iceServers?: unknown } = {}) {
         super();
+
+        // External legs (browser<->SFU bridging) pass the app's iceServers so node-datachannel
+        // gathers reachable srflx/relay candidates; internal/browser-facing legs default to [].
+        this.rawConn = new NodeDataChannel.PeerConnection("MockRTCConnection", {
+            iceServers: toNodeDataChannelIceServers(connConfig.iceServers) as any,
+            forceMediaTransport: true
+        });
 
         this.rawConn!.onDataChannel((channel) => {
             if (!this.rawConn) return; // https://github.com/murat-dogan/node-datachannel/issues/103
@@ -184,6 +245,28 @@ export class RTCConnection extends EventEmitter {
         const { type: offerType, sdp: offerSdp } = description;
         if (!offerSdp) throw new Error("Cannot set MockRTC peer description without providing an SDP");
         this.rawConn.setRemoteDescription(offerSdp, offerType[0].toUpperCase() + offerType.slice(1) as any);
+
+        // Flush trickled candidates that arrived before the remote description was set.
+        const pending = this.pendingRemoteCandidates;
+        this.pendingRemoteCandidates = [];
+        for (const c of pending) {
+            try { this.rawConn.addRemoteCandidate(c.candidate, c.mid); } catch (e) { /* ignore */ }
+        }
+    }
+
+    /** Add a remote (trickled) ICE candidate, buffering until the remote description is set. */
+    addRemoteCandidate(candidateInit: { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null }) {
+        if (!this.rawConn) return;
+        const candidate = candidateInit?.candidate;
+        if (!candidate) return; // end-of-candidates sentinel / empty
+        const mid = candidateInit.sdpMid != null
+            ? candidateInit.sdpMid
+            : (candidateInit.sdpMLineIndex != null ? String(candidateInit.sdpMLineIndex) : "0");
+        if (!this.remoteDescription) {
+            this.pendingRemoteCandidates.push({ candidate, mid });
+            return;
+        }
+        try { this.rawConn.addRemoteCandidate(candidate, mid); } catch (e) { /* ignore */ }
     }
 
     /**
@@ -423,6 +506,10 @@ export class RTCConnection extends EventEmitter {
             } else {
                 return this.buildLocalDescription();
             }
+        },
+
+        addRemoteCandidate: async (candidate: any): Promise<void> => {
+            this.addRemoteCandidate(candidate);
         }
     };
 

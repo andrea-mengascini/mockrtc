@@ -238,7 +238,7 @@ export class MockRTCServerPeer implements MockRTCPeer {
     async createExternalOffer(options: OfferOptions = {}): Promise<MockRTCExternalOfferParams> {
         if (this.debug) console.log(`Creating external peer offer for ${this.peerId}`);
 
-        const externalConn = new RTCConnection();
+        const externalConn = new RTCConnection({ iceServers: (options as any)?.iceServers });
         this.unassignedExternalConnections[externalConn.id] = externalConn;
         this.trackConnection(externalConn);
 
@@ -259,7 +259,7 @@ export class MockRTCServerPeer implements MockRTCPeer {
     ): Promise<MockRTCExternalAnswerParams> {
         if (this.debug) console.log(`Answering offer with external peer for ${this.peerId}`);
 
-        const externalConn = new RTCConnection();
+        const externalConn = new RTCConnection({ iceServers: (options as any)?.iceServers });
         this.unassignedExternalConnections[externalConn.id] = externalConn;
         this.trackConnection(externalConn);
 

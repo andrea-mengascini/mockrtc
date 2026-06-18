@@ -69,6 +69,7 @@ export class MockRTCAdminPlugin implements PluggableAdmin.AdminPlugin<MockRTCOpt
             createOffer(peerId: ID!, sessionId: ID, options: Raw): Session!
             createExternalOffer(peerId: ID!, options: Raw): Session!
             completeOffer(peerId: ID!, sessionId: ID!, answer: SessionDescriptionInput!): Void
+            addRemoteCandidate(peerId: ID!, sessionId: ID!, candidate: Raw!): Void
 
             answerOffer(peerId: ID!, sessionId: ID, offer: SessionDescriptionInput!, options: Raw): Session!
             answerExternalOffer(peerId: ID!, offer: SessionDescriptionInput!, options: Raw): Session!
@@ -319,6 +320,14 @@ export class MockRTCAdminPlugin implements PluggableAdmin.AdminPlugin<MockRTCOpt
                 }): Promise<void> => {
                     const session = this.mockRTCServer.getPeer(peerId).getSession(sessionId);
                     await session.completeOffer(answer);
+                },
+                addRemoteCandidate: async (__: any, { peerId, sessionId, candidate } : {
+                    peerId: string,
+                    sessionId: string,
+                    candidate: any
+                }): Promise<void> => {
+                    const session = this.mockRTCServer.getPeer(peerId).getSession(sessionId);
+                    await session.addRemoteCandidate(candidate);
                 },
                 answerOffer: async (__: any, { peerId, sessionId, offer, options } : {
                     peerId: string,

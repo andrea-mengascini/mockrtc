@@ -251,6 +251,25 @@ class RemoteSessionApi implements MockRTCSession {
         });
     }
 
+    addRemoteCandidate(candidate: any): Promise<void> {
+        return this.adminClient.sendQuery<void>({
+            query: gql`
+                mutation AddPeerRTCRemoteCandidate(
+                    $peerId: ID!,
+                    $sessionId: ID!,
+                    $candidate: Raw!
+                ) {
+                    addRemoteCandidate(peerId: $peerId, sessionId: $sessionId, candidate: $candidate)
+                }
+            `,
+            variables: {
+                peerId: this.peerId,
+                sessionId: this.sessionId,
+                candidate
+            }
+        });
+    }
+
     answerOffer(
         offer: MockRTCSessionDescription,
         options?: AnswerOptions

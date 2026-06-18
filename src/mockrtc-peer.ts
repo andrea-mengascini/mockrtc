@@ -125,6 +125,11 @@ export interface MockRTCSession {
      * Get an answer given an offer from elsewhere, to renegotiate the existing connection.
      */
     answerOffer(offer: RTCSessionDescriptionInit, options?: AnswerOptions): Promise<MockRTCSessionDescription>;
+
+    /**
+     * Add a remote (trickled) ICE candidate to this session's connection.
+     */
+    addRemoteCandidate(candidate: { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null }): Promise<void>;
 }
 
 export interface MockRTCOfferParams {
