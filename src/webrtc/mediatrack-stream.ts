@@ -6,6 +6,13 @@
 import * as stream from 'stream';
 import type * as NodeDataChannel from 'node-datachannel';
 
+// Per-packet RTP recording is opt-in via MOCKRTC_RECORD_MEDIA (off|audio|all).
+// When enabled we additionally emit 'read-data'/'wrote-data' (mirroring
+// DataChannelStream) so the server sink can persist the raw RTP. When off this
+// is a single boolean check per packet => effectively zero overhead.
+const SHOULD_RECORD_MEDIA = !!process.env.MOCKRTC_RECORD_MEDIA
+    && process.env.MOCKRTC_RECORD_MEDIA !== 'off';
+
 /**
  * Turns a node-datachannel media track into a real Node.js stream, complete with
  * buffering, backpressure (up to a point - if the buffer fills up, messages are dropped),
@@ -29,6 +36,8 @@ export class MediaTrackStream extends stream.Duplex {
 
         rawTrack.onMessage((msg) => {
             this._totalBytesReceived += msg.byteLength;
+
+            if (SHOULD_RECORD_MEDIA) this.emit('read-data', msg);
 
             if (!this._readActive) return; // If the buffer is full, drop messages.
 
@@ -100,6 +109,7 @@ export class MediaTrackStream extends stream.Duplex {
         try {
             sentOk = this.rawTrack.sendMessageBinary(chunk);
             this._totalBytesSent += chunk.byteLength;
+            if (SHOULD_RECORD_MEDIA) this.emit('wrote-data', chunk);
         } catch (err: any) {
             return callback(err);
         }
@@ -126,6 +136,7 @@ export class MediaTrackStream extends stream.Duplex {
             const combinedChunks = Buffer.concat(chunks.map(c => c.chunk));
             sentOk = this.rawTrack.sendMessageBinary(combinedChunks);
             this._totalBytesSent += combinedChunks.byteLength;
+            if (SHOULD_RECORD_MEDIA) this.emit('wrote-data', combinedChunks);
         } catch (err: any) {
             return callback(err);
         }

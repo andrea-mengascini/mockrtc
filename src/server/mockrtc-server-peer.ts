@@ -168,6 +168,23 @@ export class MockRTCServerPeer implements MockRTCPeer {
                     if (mediaTrack.isOpen) announceOpen();
                     else mediaTrack.on('track-open', announceOpen);
 
+                    // Per-packet RTP recording (opt-in via MOCKRTC_RECORD_MEDIA in mockrtc).
+                    // MediaTrackStream only emits read-data/wrote-data when recording is on,
+                    // so these listeners are dormant (and free) otherwise.
+                    const emitTrackData = (direction: 'sent' | 'received') => (data: Buffer) => {
+                        const content: Buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                        this.eventEmitter.emit(`media-track-data-${direction}`, {
+                            ...trackEventParams,
+                            trackType: mediaTrack.type,
+                            trackDirection: mediaTrack.direction,
+                            direction,
+                            content,
+                            eventTimestamp: performance.now()
+                        });
+                    };
+                    mediaTrack.on('read-data', emitTrackData('received'));
+                    mediaTrack.on('wrote-data', emitTrackData('sent'));
+
                     let previousBytesSent = 0;
                     let previousBytesReceived = 0;
 
